@@ -31,30 +31,24 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Resources;
-import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.security.keystore.KeyPermanentlyInvalidatedException;
 import android.security.keystore.UserNotAuthenticatedException;
-import android.text.Html;
-import android.text.InputType;
 import android.text.SpannableString;
 import android.text.method.LinkMovementMethod;
 import android.text.util.Linkify;
 import android.util.Log;
 import android.util.Pair;
-import android.view.Gravity;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.EditText;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import com.google.android.material.floatingactionbutton.FloatingActionButton;
-import com.google.android.material.snackbar.Snackbar;
 
 import org.fedorahosted.freeotp.Code;
 import org.fedorahosted.freeotp.TokenIcon;
@@ -65,6 +59,7 @@ import org.fedorahosted.freeotp.TokenPersistence;
 import org.fedorahosted.freeotp.main.share.ShareFragment;
 import org.fedorahosted.freeotp.utils.GridLayoutItemDecoration;
 import org.fedorahosted.freeotp.utils.SelectableAdapter;
+import org.fedorahosted.freeotp.utils.UserNotifier;
 
 import java.io.IOException;
 import java.lang.ref.WeakReference;
@@ -79,10 +74,12 @@ import javax.crypto.SecretKey;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.annotation.StringRes;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
 import androidx.core.content.ContextCompat;
+import androidx.core.text.HtmlCompat;
 import androidx.recyclerview.widget.RecyclerView;
 
 public class Activity extends AppCompatActivity
@@ -100,6 +97,7 @@ public class Activity extends AppCompatActivity
     private TextView mEmpty;
     private Menu mMenu;
     private MenuItem mAutoClipboard;
+    private MenuItem mSortByMru;
     ActivityResultLauncher<Intent> mManualAddLauncher;
     ActivityResultLauncher<Intent> mBackupSaveLauncher;
     ActivityResultLauncher<Intent> mRestoreSaveLauncher;
@@ -112,6 +110,7 @@ public class Activity extends AppCompatActivity
     private SharedPreferences mSettings;
     static final String SETTINGS = "settings";
     static final String AUTO_COPY_CLIPBOARD = "copyClipboard";
+    public static final String SORT_BY_MRU = "sortByMostRecentlyUsed";
 
 
     private final RecyclerView.AdapterDataObserver mAdapterDataObserver =
@@ -134,17 +133,23 @@ public class Activity extends AppCompatActivity
 
     private void onActivate(ViewHolder vh) {
         try {
-            Log.i(LOGTAG, String.format("onActivate: adapter.getCode()"));
-            Code code = mTokenAdapter.getCode(vh.getAdapterPosition());
+            Log.i(LOGTAG, "onActivate: adapter.getCode()");
+            int position = vh.getAdapterPosition();
+            Code code = mTokenAdapter.getCode(position);
+
             if (mSettings.getBoolean(AUTO_COPY_CLIPBOARD, false)) {
                 ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
                 ClipData clip = ClipData.newPlainText("code", code.getCode());
                 clipboard.setPrimaryClip(clip);
             }
 
-            Token.Type type = mTokenAdapter.getTokenType(vh.getAdapterPosition());
-            Log.i(LOGTAG, String.format("onActivate: vh.displayCode()"));
-            vh.displayCode(code, type);
+            Log.i(LOGTAG, "onActivate: vh.displayCode()");
+            vh.displayCode(code);
+
+            // Defer sorting to next frame to avoid ViewHolder rebinding during click
+            if (mSettings.getBoolean(SORT_BY_MRU, false)) {
+                new Handler(Looper.getMainLooper()).post(() -> mTokenAdapter.sortByMostRecentlyUsed());
+            }
 
         } catch (UserNotAuthenticatedException e) {
             Log.e(LOGTAG, "Exception", e);
@@ -181,10 +186,6 @@ public class Activity extends AppCompatActivity
         }
     }
 
-    private void showToast(String msg) {
-        Toast.makeText(getApplicationContext(), msg,Toast.LENGTH_SHORT).show();
-    }
-
     interface LauncherCallback {
         void execute(Uri uri);
     }
@@ -215,19 +216,15 @@ public class Activity extends AppCompatActivity
         mBackupSaveLauncher = registerLauncher(uri -> {
             /* Copy tokenBackup to picked file on external storage */
             mTokenBackup.copyBackupToExternal(uri);
-            showToast("Backup file saved to external storage");
+            UserNotifier.show(this, R.string.backup_toast);
         });
 
         mRestoreSaveLauncher = registerLauncher(uri -> {
-            final EditText input = new EditText(getApplicationContext());
-            input.setTypeface(Typeface.SERIF);
-            input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-
             /* Copy chosen file (externalBackup.xml) over apps tokenBackup.xml SP file */
             mTokenBackup.restoreBackupFromExternal(uri);
 
             /* Prompt for restore */
-            showRestoreAlert(input);
+            showRestoreAlert();
         });
     }
 
@@ -335,11 +332,7 @@ public class Activity extends AppCompatActivity
 
         if (mBackups.getBoolean(RESTORED, false)) {
             mBackups.edit().remove(RESTORED).apply();
-            final EditText input = new EditText(this);
-            input.setTypeface(Typeface.SERIF);
-            input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-
-            showRestoreAlert(input);
+            showRestoreAlert();
         }
 
         onNewIntent(getIntent());
@@ -370,62 +363,55 @@ public class Activity extends AppCompatActivity
             /* Should not be needed since this is the default, here as fallback */
             mAutoClipboard.setIcon(R.drawable.ic_check_box_blank);
         }
+
+        mSortByMru = menu.findItem(R.id.action_sort_mru);
+        /* Set checked/unchecked checkbox in menu for sort by MRU setting */
+        if(mSettings.getBoolean(SORT_BY_MRU, false)) {
+            mSortByMru.setIcon(R.drawable.ic_check_box_checked);
+        } else {
+            mSortByMru.setIcon(R.drawable.ic_check_box_blank);
+        }
         return true;
     }
 
-    private void showRestoreCancelAlert(final EditText input) {
-        new AlertDialog.Builder(Activity.this)
-                .setTitle(R.string.main_restore_cancel_title)
-                .setMessage(R.string.main_restore_cancel_message)
-                .setCancelable(false)
-                .setNegativeButton(R.string.main_restore_go_back, new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        if(input.getParent() != null) {
-                            ((ViewGroup)input.getParent()).removeView(input); // <- fix
-                        }
-                        showRestoreAlert(input);
-                    }
-                })
-                .setPositiveButton(R.string.main_restore_proceed, null)
-                .show();
+    private void showRestoreCancelAlert() {
+        RestoreCancelDialogFragment cancelDialog = RestoreCancelDialogFragment.newInstance();
+        cancelDialog.setListener(new RestoreCancelDialogFragment.RestoreCancelDialogListener() {
+            @Override
+            public void onGoBack() {
+                showRestoreAlert();
+            }
+
+            @Override
+            public void onProceed() {
+                // User chose to proceed without restoring
+            }
+        });
+        cancelDialog.show(getSupportFragmentManager(), "restore_cancel");
     }
 
-    private void showRestoreAlert(final EditText input) {
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.main_restore_title)
-                .setMessage(R.string.main_restore_message)
-                .setCancelable(false)
-                .setView(input)
-                .setNegativeButton(R.string.cancel, new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        showRestoreCancelAlert(input);
-                    }
-                })
-                .setPositiveButton(R.string.ok, new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        if (input != null) {
-                            mRestorePwd = input.getText().toString();
+    private void showRestoreAlert() {
+        RestoreDialogFragment restoreDialog = RestoreDialogFragment.newInstance();
+        restoreDialog.setListener(new RestoreDialogFragment.RestoreDialogListener() {
+            @Override
+            public void onRestorePassword(String password) {
+                mRestorePwd = password;
 
-                            try {
-                                mTokenAdapter.restoreTokens(mRestorePwd);
-                            } catch (TokenPersistence.BadPasswordException e) {
-                                Toast badpwd = Toast.makeText(getApplicationContext(),
-                                        R.string.main_restore_bad_password,Toast.LENGTH_SHORT);
-                                badpwd.setGravity(Gravity.CENTER_HORIZONTAL|Gravity.CENTER_VERTICAL, 0, 0);
-                                badpwd.show();
-                                dialog.dismiss();
-                                if(input.getParent() != null) {
-                                    ((ViewGroup)input.getParent()).removeView(input); // <- fix
-                                }
-                                input.setText("");
-                                showRestoreAlert(input);
-                            }
-                        }
-                    }
-                }).show();
+                try {
+                    mTokenAdapter.restoreTokens(mRestorePwd);
+                    restoreDialog.dismiss();
+                } catch (TokenPersistence.BadPasswordException e) {
+                    restoreDialog.showBadPasswordError();
+                }
+            }
+
+            @Override
+            public void onRestoreCancel() {
+                restoreDialog.dismiss();
+                showRestoreCancelAlert();
+            }
+        });
+        restoreDialog.show(getSupportFragmentManager(), "restore");
     }
 
     @Override
@@ -442,7 +428,7 @@ public class Activity extends AppCompatActivity
                     final AlertDialog dialog = new AlertDialog.Builder(this)
                             .setTitle(r.getString(R.string.main_about_title,
                                     info.versionName, info.versionCode))
-                            .setMessage(Html.fromHtml(r.getString(R.string.main_about_message)))
+                            .setMessage(HtmlCompat.fromHtml(r.getString(R.string.main_about_message), HtmlCompat.FROM_HTML_MODE_LEGACY))
                             .setPositiveButton(R.string.close, null)
                             .create();
 
@@ -514,12 +500,29 @@ public class Activity extends AppCompatActivity
                 boolean copy_clipboard = mSettings.getBoolean(AUTO_COPY_CLIPBOARD, false);
 
                 mSettings.edit().putBoolean(AUTO_COPY_CLIPBOARD, !copy_clipboard).apply();
-                String s = String.format("Automatic copy-to-clipboard: %s", !copy_clipboard ? "Enabled" : "Disabled");
-                Snackbar.make(findViewById(R.id.toolbar), s, Snackbar.LENGTH_SHORT)
-                        .show();
+                UserNotifier.show(this, R.string.auto_copy_clipboard_toast, !copy_clipboard ? R.string.state_enabled_toast : R.string.state_disabled_toast);
+
                 /* Update checkbox icon in menu */
                 if(mAutoClipboard == null) return true;
                 mAutoClipboard.setIcon(!copy_clipboard ? R.drawable.ic_check_box_checked : R.drawable.ic_check_box_blank);
+
+                return true;
+
+            case R.id.action_sort_mru:
+                boolean sortByMru = mSettings.getBoolean(SORT_BY_MRU, false);
+
+                mSettings.edit().putBoolean(SORT_BY_MRU, !sortByMru).apply();
+                UserNotifier.show(this, R.string.sort_by_recent_use_toast, !sortByMru ? R.string.state_enabled_toast : R.string.state_disabled_toast);
+
+                /* Update checkbox icon in menu */
+                if (mSortByMru != null) {
+                    mSortByMru.setIcon(!sortByMru ? R.drawable.ic_check_box_checked : R.drawable.ic_check_box_blank);
+                }
+
+                /* If enabling, sort immediately */
+                if (!sortByMru) {
+                    mTokenAdapter.sortByMostRecentlyUsed();
+                }
 
                 return true;
 

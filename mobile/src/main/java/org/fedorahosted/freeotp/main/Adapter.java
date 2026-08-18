@@ -54,6 +54,9 @@ import java.lang.reflect.Type;
 import java.security.GeneralSecurityException;
 import java.security.Key;
 import java.security.KeyStore;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -252,6 +255,32 @@ public class Adapter extends SelectableAdapter<ViewHolder> implements ViewHolder
         mItems.add(fromPosition, uuid);
     }
 
+    public void sortByMostRecentlyUsed() {
+        List<Pair<String, Long>> items = new ArrayList<>();
+
+        for (String uuid : mItems) {
+            Token token = Token.deserialize(mSharedPreferences.getString(uuid, null));
+            Long lastUsed = token != null ? token.getLastUsed() : null;
+            items.add(new Pair<>(uuid, lastUsed != null ? lastUsed : 0L));
+        }
+
+        Collections.sort(items, new Comparator<Pair<String, Long>>() {
+            @Override
+            public int compare(Pair<String, Long> a, Pair<String, Long> b) {
+                return Long.compare(b.second, a.second);
+            }
+        });
+
+        mItems.clear();
+        for (Pair<String, Long> item : items) {
+            mItems.add(item.first);
+        }
+
+        if (storeItems().commit()) {
+            notifyDataSetChanged();
+        }
+    }
+
     @Override
     public boolean onSelectionToggled(ViewHolder holder) {
         boolean selected = !isSelected(holder.getAdapterPosition());
@@ -285,9 +314,21 @@ public class Adapter extends SelectableAdapter<ViewHolder> implements ViewHolder
 
         try {
             Log.i(LOGTAG, String.format("getCode: deserialize token"));
-            Token token = Token.deserialize(mSharedPreferences.getString(uuid, null));
+            String stored = mSharedPreferences.getString(uuid, null);
+            Token token = null;
+            if (stored != null) {
+                token = Token.deserialize(stored);
+                if (token == null) {
+                    Log.e(LOGTAG, "Token is null");
+                    return new Code("ERROR", 15);
+                }
+            } else {
+                Log.e(LOGTAG, "Stored is null");
+                return new Code("ERROR", 15);
+            }
             Key key = mKeyStore.getKey(uuid, null);
             code = token.getCode(key);
+            token.setLastUsed(System.currentTimeMillis());
             mSharedPreferences.edit().putString(uuid, token.serialize()).apply();
         } catch (UserNotAuthenticatedException | KeyPermanentlyInvalidatedException e) {
             Log.e(LOGTAG, "Exception", e);
@@ -300,6 +341,10 @@ public class Adapter extends SelectableAdapter<ViewHolder> implements ViewHolder
         final Long id = getItemId(position);
         mActive.put(id, code);
 
+        // Minimum delay to prevent rapid rescheduling when timeLeft() is 0 or near-zero
+        final long MIN_DELAY_MS = 500;
+        long initialDelay = Math.max(code.timeLeft(), MIN_DELAY_MS);
+
         mHandler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -308,10 +353,12 @@ public class Adapter extends SelectableAdapter<ViewHolder> implements ViewHolder
                     return;
                 if (!code.isValid())
                     mActive.remove(id);
-                else
-                    mHandler.postDelayed(this, code.timeLeft());
+                else {
+                    long delay = Math.max(code.timeLeft(), MIN_DELAY_MS);
+                    mHandler.postDelayed(this, delay);
+                }
             }
-        }, code.timeLeft());
+        }, initialDelay);
 
         Log.i(LOGTAG, String.format("getCode: returning code"));
 
@@ -330,13 +377,6 @@ public class Adapter extends SelectableAdapter<ViewHolder> implements ViewHolder
         Token token = Token.deserialize(mSharedPreferences.getString(uuid, null));
 
         return new TokenIcon(token, mContext);
-    }
-
-    public Token.Type getTokenType(int position) {
-        String uuid = mItems.get(position);
-        Token token = Token.deserialize(mSharedPreferences.getString(uuid, null));
-
-        return token.getType();
     }
 
     public void setLabel(int position, String account, String issuer) throws IOException {

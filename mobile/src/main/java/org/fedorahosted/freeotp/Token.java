@@ -36,6 +36,7 @@ import java.security.InvalidKeyException;
 import java.security.Key;
 import java.security.NoSuchAlgorithmException;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -106,6 +107,9 @@ public class Token {
 
     @SerializedName("counter")
     private Long mCounter;
+
+    @SerializedName("lastUsed")
+    private Long mLastUsed;
 
     private class Secret {
         private byte[] secret;
@@ -367,7 +371,15 @@ public class Token {
         code |= (digest[off + 2] & 0xff) << 0x08;
         code |= (digest[off + 3] & 0xff);
 
-        return Code.Factory.fromIssuer(mIssuer).makeCode(code, mDigits, getPeriod());
+        // Steam reverses OTP code.
+        boolean reverse = Objects.equals(mIssuer, "Steam");
+
+        Code.Factory factory = Code.Factory.fromIssuer(mIssuer);
+        if (mType == Type.TOTP) {
+            return factory.makeTotpCode(code, mDigits, getPeriod(), reverse);
+        } else {
+            return factory.makeHotpCode(code, mDigits, getPeriod(), reverse);
+        }
     }
 
     public void setIssuer(String issuer) {
@@ -376,6 +388,14 @@ public class Token {
 
     public void setLabel(String label) {
         mLabel = label;
+    }
+
+    public Long getLastUsed() {
+        return mLastUsed;
+    }
+
+    public void setLastUsed(long timestamp) {
+        mLastUsed = timestamp;
     }
 
     public Uri toUri(SecretKey key) {

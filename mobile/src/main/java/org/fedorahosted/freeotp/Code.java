@@ -20,8 +20,8 @@
 
 package org.fedorahosted.freeotp;
 
+import androidx.annotation.Nullable;
 import org.fedorahosted.freeotp.utils.Time;
-import org.jetbrains.annotations.Nullable;
 
 public class Code {
     static class Factory {
@@ -47,15 +47,6 @@ public class Code {
             mDigits = getDigitsMin();
         }
 
-        private Factory(String alphabet, int defaultDigits) {
-            mAlphabet = alphabet.toCharArray();
-            mDigits = defaultDigits;
-        }
-
-        int getDigitsDefault() {
-            return mDigits;
-        }
-
         int getDigitsMin() {
             return (int) Math.ceil(Math.log(RFC_MIN) / Math.log(mAlphabet.length));
         }
@@ -64,28 +55,53 @@ public class Code {
             return (int) Math.floor(Math.log(RFC_MAX) / Math.log(mAlphabet.length));
         }
 
-        Code makeCode(int code, @Nullable Integer digits, int period) {
+        Code makeHotpCode(int code, @Nullable Integer digits, int period, boolean reverse) {
+            return makeCode(code, digits, period, reverse, false);
+        }
+
+        Code makeTotpCode(int code, @Nullable Integer digits, int period, boolean reverse) {
+            return makeCode(code, digits, period, reverse, true);
+        }
+
+        private Code makeCode(int code, @Nullable Integer digits, int period, boolean reverse, boolean alignToWindow) {
             if (digits == null)
                 digits = mDigits;
 
             char[] buffer = new char[digits];
 
             for (int i = 0; i < digits; i++) {
-                buffer[digits - i - 1] = mAlphabet[code % mAlphabet.length];
+                if (reverse)
+                    buffer[i] = mAlphabet[code % mAlphabet.length];
+                else
+                    buffer[digits - i - 1] = mAlphabet[code % mAlphabet.length];
                 code /= mAlphabet.length;
             }
 
-            return new Code(new String(buffer), period);
+            return new Code(new String(buffer), period, alignToWindow);
         }
     }
 
     private final String mCode;
     private final long mPeriod;
     private final long mStart;
+    private final long mWindowStart; // For TOTP: the epoch window this code is valid for
 
     public Code(String code, long period) {
-        mStart = Time.INSTANCE.current();
+        this(code, period, false);
+    }
+
+    public Code(String code, long period, boolean alignToWindow) {
+        long currentTime = Time.INSTANCE.current();
         mPeriod = period * 1000;
+        if (alignToWindow) {
+            // For TOTP: track which window this code is valid for
+            mStart = 0; // Flag to indicate TOTP mode
+            mWindowStart = (currentTime / mPeriod) * mPeriod;
+        } else {
+            // For HOTP: use current time when code was generated
+            mStart = currentTime;
+            mWindowStart = 0; // Not used for HOTP
+        }
         mCode = code;
     }
 
@@ -97,15 +113,18 @@ public class Code {
         return mPeriod;
     }
 
-    public long timeRemaining() {
-        long time_remaining = mPeriod - mStart % mPeriod;
-        return time_remaining / 1000;
-    }
-
     public long timeLeft() {
         long now = Time.INSTANCE.current();
-        long left = mStart + mPeriod - now;
-        return left < 0 ? 0 : left;
+        if (mStart == 0) {
+            // TOTP mode: calculate time until next period boundary based on epoch
+            long windowStart = (now / mPeriod) * mPeriod;
+            long left = windowStart + mPeriod - now;
+            return left < 0 ? 0 : left;
+        } else {
+            // HOTP mode: calculate time since code was generated
+            long left = mStart + mPeriod - now;
+            return left < 0 ? 0 : left;
+        }
     }
 
     public int getProgress(int max) {
@@ -113,6 +132,14 @@ public class Code {
     }
 
     public boolean isValid() {
-        return timeLeft() > 0;
+        if (mStart == 0) {
+            // TOTP mode: check if we're still in the same window
+            long now = Time.INSTANCE.current();
+            long currentWindowStart = (now / mPeriod) * mPeriod;
+            return currentWindowStart == mWindowStart;
+        } else {
+            // HOTP mode: check if time hasn't expired
+            return timeLeft() > 0;
+        }
     }
 }
